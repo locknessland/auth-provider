@@ -6,33 +6,40 @@
  * @module @lockness/auth-provider/drizzle/session
  */
 
-import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { Authenticatable, RememberMeToken } from '@lockness/auth'
 import { SessionProviderBase } from '../base/session_provider_base.ts'
+import type { DrizzleDatabase, DrizzleDialect } from './database.ts'
 
 /**
  * Configuration options for Drizzle session user provider.
  *
  * @typeParam User - The user entity type extending {@link Authenticatable}
+ * @typeParam D - The SQL dialect of the Drizzle handle (`pg` by default), so a
+ * `mysql` or `sqlite` `Database` handle from the #214 multi-DB work is accepted.
  */
-export interface DrizzleSessionProviderOptions<User extends Authenticatable> {
+export interface DrizzleSessionProviderOptions<
+    User extends Authenticatable,
+    D extends DrizzleDialect = 'pg',
+> {
     /**
-     * Drizzle database instance (from @lockness/drizzle Database service)
+     * Drizzle database instance (from @lockness/drizzle Database service),
+     * typed by dialect `D`.
      */
-    db: PostgresJsDatabase<Record<string, unknown>>
+    db: DrizzleDatabase<D>
 
     /**
      * Function to find user by ID
      */
     findUserById: (
-        db: PostgresJsDatabase<Record<string, unknown>>,
+        db: DrizzleDatabase<D>,
         id: string | number,
     ) => Promise<User | null>
 
-    /** \n     * Function to find user by email and verify password
+    /**
+     * Function to find user by email and verify password
      */
     findUserByCredentials: (
-        db: PostgresJsDatabase<Record<string, unknown>>,
+        db: DrizzleDatabase<D>,
         email: string,
         password: string,
     ) => Promise<User | null>
@@ -76,14 +83,16 @@ export interface DrizzleSessionProviderOptions<User extends Authenticatable> {
  *   enableRememberTokens: true
  * })
  */
-export class DrizzleSessionProvider<User extends Authenticatable>
-    extends SessionProviderBase<User> {
+export class DrizzleSessionProvider<
+    User extends Authenticatable,
+    D extends DrizzleDialect = 'pg',
+> extends SessionProviderBase<User> {
     /** @internal Provider configuration */
-    readonly #options: Required<DrizzleSessionProviderOptions<User>>
+    readonly #options: Required<DrizzleSessionProviderOptions<User, D>>
     /** @internal Whether remember tokens are enabled */
     readonly #enableRememberTokens: boolean
 
-    constructor(options: DrizzleSessionProviderOptions<User>) {
+    constructor(options: DrizzleSessionProviderOptions<User, D>) {
         super()
         this.#options = {
             ...options,
@@ -140,6 +149,7 @@ export class DrizzleSessionProvider<User extends Authenticatable>
 
         const tokenValue = await this.generateTokenValue(32)
         const hash = await this.hashTokenValue(tokenValue)
+        const now = new Date()
         const expiresAt = new Date(Date.now() + expiresIn)
 
         // This is a placeholder - subclasses should implement with their table schema
@@ -151,7 +161,9 @@ export class DrizzleSessionProvider<User extends Authenticatable>
             hash,
             userId: user.id,
             expiresAt,
-            createdAt: new Date(),
+            createdAt: now,
+            // A freshly created credential's origin is its creation instant (#146).
+            firstIssuedAt: now,
         }
     }
 
@@ -192,11 +204,35 @@ export class DrizzleSessionProvider<User extends Authenticatable>
     }
 
     /**
+     * Delete every remember-me token for a user (#147).
+     *
+     * Note: This is a base implementation. Override in a subclass with the actual
+     * table schema — e.g. `db.delete(rememberTokensTable).where(eq(userId, u.id))`.
+     *
+     * @param _user - The token owner whose remember-me credentials to drop.
+     */
+    // deno-lint-ignore require-await
+    async deleteAllRememberTokens(_user: User): Promise<void> {
+        if (!this.#enableRememberTokens) {
+            return
+        }
+
+        // A silent no-op here would reopen the ASVS 7.4.2 remember-me re-mint
+        // bypass #147 exists to close — "log out everywhere" would leave the
+        // user's tokens live. Force a schema-carrying subclass to override it
+        // (unlike the read/create placeholders, this is security-critical).
+        throw new Error(
+            'deleteAllRememberTokens must be overridden with your remember-me table schema — ' +
+                'e.g. db.delete(rememberTokensTable).where(eq(rememberTokensTable.userId, user.id))',
+        )
+    }
+
+    /**
      * Recycle a remember me token (for security)
      */
     async recycleRememberToken(
         user: User,
-        tokenId: string | number,
+        token: RememberMeToken,
         expiresIn: number,
     ): Promise<RememberMeToken> {
         if (!this.#enableRememberTokens) {
@@ -206,9 +242,12 @@ export class DrizzleSessionProvider<User extends Authenticatable>
         }
 
         // Delete old token
-        await this.deleteRememberToken(user, tokenId)
+        await this.deleteRememberToken(user, token.identifier)
 
-        // Create new token
-        return await this.createRememberToken(user, expiresIn)
+        // Create new token, then bare-copy the origin forward so the absolute
+        // clock is never reset by renewal (#146). No fallback here — the guard
+        // resolved firstIssuedAt before calling.
+        const fresh = await this.createRememberToken(user, expiresIn)
+        return { ...fresh, firstIssuedAt: token.firstIssuedAt }
     }
 }

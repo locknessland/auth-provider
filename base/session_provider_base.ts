@@ -141,12 +141,26 @@ export abstract class SessionProviderBase<User extends Authenticatable>
     ): Promise<void>
 
     /**
-     * Recycle a remember me token (for security)
-     * Must be implemented by subclasses that support remember tokens
+     * Delete every remember-me token for a user (#147).
+     *
+     * Called by the guard's per-user eviction so a captured remember-me cookie
+     * cannot re-mint a post-eviction session. Subclasses that support remember
+     * tokens must drop all of the user's rows.
+     */
+    abstract deleteAllRememberTokens(user: User): Promise<void>
+
+    /**
+     * Recycle a remember me token (for security).
+     * Must be implemented by subclasses that support remember tokens.
+     *
+     * Receives the whole verified token so the renewed token can bare-copy
+     * `firstIssuedAt` from it (`new.firstIssuedAt = token.firstIssuedAt`) — the
+     * origin the remember-me absolute-lifetime cap is measured from (#146). The
+     * guard resolves the origin before calling; the provider does no fallback.
      */
     abstract recycleRememberToken(
         user: User,
-        tokenId: string | number,
+        token: RememberMeToken,
         expiresIn: number,
     ): Promise<RememberMeToken>
 }
